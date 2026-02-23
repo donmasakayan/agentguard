@@ -94,9 +94,9 @@ if [ -n "$CONFIG_FILE" ]; then
     echo "agentguard: Using config: $CONFIG_FILE"
 fi
 
-# Create tarball
+# Create tarball (COPYFILE_DISABLE prevents macOS xattr headers)
 TARBALL="$PAYLOAD_DIR/agentguard-payload.tar.gz"
-tar czf "$TARBALL" -C "$PAYLOAD_DIR" agentguard-payload
+COPYFILE_DISABLE=1 tar czf "$TARBALL" -C "$PAYLOAD_DIR" agentguard-payload
 
 TARBALL_SIZE=$(wc -c < "$TARBALL" | tr -d ' ')
 echo "agentguard: Payload size: ${TARBALL_SIZE} bytes"
@@ -116,10 +116,10 @@ if [ -n "$MODULES_FILTER" ]; then
 fi
 
 # shellcheck disable=SC2086,SC2029
-ssh $SSH_OPTS -t "$SSH_TARGET" "
+ssh $SSH_OPTS "$SSH_TARGET" "
     cd /tmp && \
-    tar xzf agentguard-payload.tar.gz && \
-    $REMOTE_ENV bash agentguard-payload/runner.sh && \
+    tar xzf agentguard-payload.tar.gz 2>/dev/null && \
+    sudo $REMOTE_ENV bash agentguard-payload/runner.sh && \
     rm -rf /tmp/agentguard-payload /tmp/agentguard-payload.tar.gz
 "
 

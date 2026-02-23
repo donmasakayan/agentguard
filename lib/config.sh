@@ -24,7 +24,9 @@ load_config() {
 # Usage: is_module_enabled "swap" && run_module
 is_module_enabled() {
     local module="$1"
-    local var="MODULE_${module^^}"  # e.g., MODULE_SWAP
+    # Replace hyphens with underscores for valid bash variable names
+    local module_clean="${module//-/_}"
+    local var="MODULE_${module_clean^^}"  # e.g., MODULE_SWAP, MODULE_TSC_GUARD
     local value="${!var:-}"
 
     # If MODULES_FILTER is set (from --module flag), only run those

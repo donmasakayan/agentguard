@@ -145,8 +145,10 @@ else
 fi
 
 # Count active tsc processes
-tsc_count=$(pgrep -c 'tsc-real\|node.*tsc' 2>/dev/null || echo "0")
-if [ "$tsc_count" -gt 0 ]; then
+tsc_count=$(pgrep -c -f 'tsc-real|tsc.*--build' 2>/dev/null || true)
+tsc_count="${tsc_count:-0}"
+tsc_count="${tsc_count// /}"
+if [ "$tsc_count" -gt 0 ] 2>/dev/null; then
     ok "Active tsc processes: $tsc_count"
 else
     ok "No active tsc processes"
