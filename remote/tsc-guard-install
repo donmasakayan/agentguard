@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# tsc-guard-install: Install tsc-guard shim into node_modules/.bin for a project
+# Usage: tsc-guard-install [dir...]
+# If no dirs given, searches common locations.
+#
+# What it does:
+#   1. Renames node_modules/.bin/tsc -> tsc-real (backup of original)
+#   2. Symlinks tsc-guard as node_modules/.bin/tsc
+#   3. Turbo/npm scripts that invoke tsc now go through the semaphore
+#
+# Safe to re-run: skips directories already guarded.
+
+set -euo pipefail
+
+# Find tsc-guard binary
+GUARD=""
+for candidate in /usr/local/bin/tsc-guard "$HOME/.local/bin/tsc-guard"; do
+    if [ -x "$candidate" ]; then
+        GUARD="$candidate"
+        break
+    fi
+done
+
+if [ -z "$GUARD" ]; then
+    echo "ERROR: tsc-guard not found in /usr/local/bin or ~/.local/bin" >&2
+    exit 1
+fi
+
+install_guard() {
+    local dir="$1"
+    local tsc="$dir/node_modules/.bin/tsc"
+    local tsc_real="$dir/node_modules/.bin/tsc-real"
+
+    if [ ! -e "$tsc" ] && [ ! -L "$tsc" ]; then
+        echo "  skip: $dir (no node_modules/.bin/tsc)"
+        return 0
+    fi
+
+    # Already installed?
+    if [ -L "$tsc" ]; then
+        local target
+        target="$(readlink "$tsc" 2>/dev/null || echo "")"
+        if [ "$target" = "$GUARD" ]; then
+            echo "  skip: $dir (already guarded)"
+            return 0
+        fi
+    fi
+
+    # Backup original tsc -> tsc-real
+    if [ ! -e "$tsc_real" ]; then
+        mv "$tsc" "$tsc_real"
+        echo "  backed up: tsc -> tsc-real"
+    fi
+
+    # Symlink guard as tsc
+    ln -sf "$GUARD" "$tsc"
+    echo "  done: $dir"
+}
+
+if [ $# -gt 0 ]; then
+    echo "Installing tsc-guard shim..."
+    for dir in "$@"; do
+        install_guard "$dir"
+    done
+else
+    echo "Usage: tsc-guard-install <project-dir> [project-dir...]"
+    echo ""
+    echo "Example:"
+    echo "  tsc-guard-install ~/myproject"
+    echo "  tsc-guard-install ~/myproject ~/other-project"
+    echo ""
+    echo "Run after 'npm install' / 'bun install' to re-shim tsc."
+    exit 0
+fi
+
+echo "Complete. tsc-guard is active (max ${TSC_GUARD_MAX_SLOTS:-3} concurrent)."

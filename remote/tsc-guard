@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# tsc-guard: Semaphore wrapper for TypeScript compiler
+# Limits concurrent tsc processes to prevent OOM on VPS
+# Uses flock-based slot locking — automatic release on process exit
+#
+# Install: symlink this as node_modules/.bin/tsc, rename original to tsc-real
+# Config: TSC_GUARD_MAX_SLOTS controls concurrency (default: 3)
+
+set -euo pipefail
+
+MAX_SLOTS="${TSC_GUARD_MAX_SLOTS:-3}"
+LOCK_DIR="/tmp/tsc-semaphore"
+WAIT_INTERVAL=2
+MAX_WAIT=300  # 5 minute timeout
+
+mkdir -p "$LOCK_DIR"
+
+# Find the real tsc binary (look for tsc-real next to us, then walk up node_modules)
+find_real_tsc() {
+    local self_dir
+    self_dir="$(cd "$(dirname "$0")" && pwd)"
+
+    # Check sibling tsc-real at the invocation directory
+    # This handles the node_modules/.bin/tsc -> tsc-guard symlink case
+    if [ -x "$self_dir/tsc-real" ]; then
+        echo "$self_dir/tsc-real"
+        return 0
+    fi
+
+    # The symlink is in node_modules/.bin/ — $0 is the symlink path
+    local called_as_dir
+    called_as_dir="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$called_as_dir/tsc-real" ]; then
+        echo "$called_as_dir/tsc-real"
+        return 0
+    fi
+
+    # Fallback: walk up from cwd looking for node_modules/.bin/tsc-real
+    local search_dir="$PWD"
+    while [ "$search_dir" != "/" ]; do
+        if [ -x "$search_dir/node_modules/.bin/tsc-real" ]; then
+            echo "$search_dir/node_modules/.bin/tsc-real"
+            return 0
+        fi
+        search_dir="$(dirname "$search_dir")"
+    done
+
+    echo "tsc-guard: ERROR: Could not find real tsc binary (tsc-real)" >&2
+    return 1
+}
+
+acquire_slot() {
+    local waited=0
+    while true; do
+        for slot in $(seq 1 "$MAX_SLOTS"); do
+            local lock_file="$LOCK_DIR/slot-$slot.lock"
+            # Open fd for this lock file
+            local fd
+            exec {fd}>"$lock_file"
+            # Try non-blocking exclusive lock
+            if flock -n "$fd" 2>/dev/null; then
+                # Got the lock. The lock is held as long as the fd is open
+                # (until this process or exec'd child exits).
+                export TSC_GUARD_LOCK_FD="$fd"
+                echo "$slot"
+                return 0
+            else
+                # Didn't get lock, close fd
+                exec {fd}>&-
+            fi
+        done
+
+        # All slots busy
+        if [ "$waited" -ge "$MAX_WAIT" ]; then
+            echo "tsc-guard: TIMEOUT waiting for slot after ${MAX_WAIT}s, running anyway" >&2
+            echo "0"
+            return 0
+        fi
+
+        if [ "$waited" -eq 0 ]; then
+            echo "tsc-guard: All $MAX_SLOTS slots busy, waiting..." >&2
+        fi
+        sleep "$WAIT_INTERVAL"
+        waited=$((waited + WAIT_INTERVAL))
+    done
+}
+
+REAL_TSC="$(find_real_tsc)"
+SLOT="$(acquire_slot)"
+
+if [ "$SLOT" != "0" ]; then
+    echo "tsc-guard: Acquired slot $SLOT/$MAX_SLOTS (pid $$)" >&2
+fi
+
+# exec replaces this process with tsc — lock fd stays open, released on tsc exit
+exec "$REAL_TSC" "$@"
