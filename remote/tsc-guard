@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tsc-guard: Semaphore wrapper for TypeScript compiler
-# Limits concurrent tsc processes to prevent OOM on VPS
-# Uses flock-based slot locking — automatic release on process exit
+# Limits concurrent tsc processes to prevent OOM
+# Cross-platform: uses flock on Linux, mkdir-based locking on macOS
 #
 # Install: symlink this as node_modules/.bin/tsc, rename original to tsc-real
 # Config: TSC_GUARD_MAX_SLOTS controls concurrency (default: 3)
@@ -15,23 +15,19 @@ MAX_WAIT=300  # 5 minute timeout
 
 mkdir -p "$LOCK_DIR"
 
+# Detect platform
+HAS_FLOCK=false
+if command -v flock >/dev/null 2>&1; then
+    HAS_FLOCK=true
+fi
+
 # Find the real tsc binary (look for tsc-real next to us, then walk up node_modules)
 find_real_tsc() {
+    # Check sibling tsc-real at the invocation directory
     local self_dir
     self_dir="$(cd "$(dirname "$0")" && pwd)"
-
-    # Check sibling tsc-real at the invocation directory
-    # This handles the node_modules/.bin/tsc -> tsc-guard symlink case
     if [ -x "$self_dir/tsc-real" ]; then
         echo "$self_dir/tsc-real"
-        return 0
-    fi
-
-    # The symlink is in node_modules/.bin/ — $0 is the symlink path
-    local called_as_dir
-    called_as_dir="$(cd "$(dirname "$0")" && pwd)"
-    if [ -x "$called_as_dir/tsc-real" ]; then
-        echo "$called_as_dir/tsc-real"
         return 0
     fi
 
@@ -49,24 +45,45 @@ find_real_tsc() {
     return 1
 }
 
-acquire_slot() {
+# --- mkdir-based locking (macOS compatible) ---
+# Uses mkdir atomicity as a lock. Stale locks cleaned up via PID check.
+
+cleanup_stale_lock() {
+    local lock_path="$1"
+    local pid_file="$lock_path/pid"
+    if [ -f "$pid_file" ]; then
+        local lock_pid
+        lock_pid=$(cat "$pid_file" 2>/dev/null || echo "")
+        if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            # Process is dead, clean up stale lock
+            rm -rf "$lock_path"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+acquire_slot_mkdir() {
     local waited=0
     while true; do
         for slot in $(seq 1 "$MAX_SLOTS"); do
-            local lock_file="$LOCK_DIR/slot-$slot.lock"
-            # Open fd for this lock file
-            local fd
-            exec {fd}>"$lock_file"
-            # Try non-blocking exclusive lock
-            if flock -n "$fd" 2>/dev/null; then
-                # Got the lock. The lock is held as long as the fd is open
-                # (until this process or exec'd child exits).
-                export TSC_GUARD_LOCK_FD="$fd"
+            local lock_path="$LOCK_DIR/slot-$slot"
+
+            # Try to create lock dir (atomic on all platforms)
+            if mkdir "$lock_path" 2>/dev/null; then
+                echo $$ > "$lock_path/pid"
                 echo "$slot"
                 return 0
-            else
-                # Didn't get lock, close fd
-                exec {fd}>&-
+            fi
+
+            # Lock exists — check if stale
+            if cleanup_stale_lock "$lock_path"; then
+                # Cleaned up stale lock, try again
+                if mkdir "$lock_path" 2>/dev/null; then
+                    echo $$ > "$lock_path/pid"
+                    echo "$slot"
+                    return 0
+                fi
             fi
         done
 
@@ -85,12 +102,67 @@ acquire_slot() {
     done
 }
 
+release_slot_mkdir() {
+    local slot="$1"
+    if [ "$slot" != "0" ]; then
+        rm -rf "$LOCK_DIR/slot-$slot"
+    fi
+}
+
+# --- flock-based locking (Linux) ---
+# Uses bash 4.1+ fd allocation + flock. Lock auto-released on exec/exit.
+
+acquire_slot_flock() {
+    local waited=0
+    while true; do
+        for slot in $(seq 1 "$MAX_SLOTS"); do
+            local lock_file="$LOCK_DIR/slot-$slot.lock"
+            local fd
+            eval "exec {fd}>\"$lock_file\""
+            if flock -n "$fd" 2>/dev/null; then
+                export TSC_GUARD_LOCK_FD="$fd"
+                echo "$slot"
+                return 0
+            else
+                eval "exec {fd}>&-"
+            fi
+        done
+
+        if [ "$waited" -ge "$MAX_WAIT" ]; then
+            echo "tsc-guard: TIMEOUT waiting for slot after ${MAX_WAIT}s, running anyway" >&2
+            echo "0"
+            return 0
+        fi
+
+        if [ "$waited" -eq 0 ]; then
+            echo "tsc-guard: All $MAX_SLOTS slots busy, waiting..." >&2
+        fi
+        sleep "$WAIT_INTERVAL"
+        waited=$((waited + WAIT_INTERVAL))
+    done
+}
+
+# --- Main ---
+
 REAL_TSC="$(find_real_tsc)"
-SLOT="$(acquire_slot)"
 
-if [ "$SLOT" != "0" ]; then
-    echo "tsc-guard: Acquired slot $SLOT/$MAX_SLOTS (pid $$)" >&2
+if [ "$HAS_FLOCK" = true ] && [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
+    # Linux path: flock + auto fd (lock released automatically on exec/exit)
+    SLOT="$(acquire_slot_flock)"
+    if [ "$SLOT" != "0" ]; then
+        echo "tsc-guard: Acquired slot $SLOT/$MAX_SLOTS (pid $$)" >&2
+    fi
+    exec "$REAL_TSC" "$@"
+else
+    # macOS path: mkdir-based lock (must trap to release)
+    SLOT="$(acquire_slot_mkdir)"
+    if [ "$SLOT" != "0" ]; then
+        echo "tsc-guard: Acquired slot $SLOT/$MAX_SLOTS (pid $$)" >&2
+    fi
+
+    # Trap to release lock on exit (normal, error, or signal)
+    trap 'release_slot_mkdir "$SLOT"' EXIT
+
+    # Run tsc (not exec — need trap to fire)
+    "$REAL_TSC" "$@"
 fi
-
-# exec replaces this process with tsc — lock fd stays open, released on tsc exit
-exec "$REAL_TSC" "$@"
